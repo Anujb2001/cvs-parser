@@ -1,0 +1,126 @@
+services:
+  # ---------------------------------------------------------------------------
+  # 1. REACT FRONTEND APPLICATION
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../.docker/Dockerfile.frontend
+    container_name: forensic_frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend_api
+    networks:
+      - forensic_network
+    restart: always
+
+  # ---------------------------------------------------------------------------
+  # 2. FASTAPI BACKEND SERVICE
+  # ---------------------------------------------------------------------------
+  backend_api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: forensic_backend
+    ports:
+      - "8001:8001"
+    environment:
+      - CLICKHOUSE_HOST=clickhouse_db
+      - POSTGRES_HOST=postgres_db
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434  # <--- Point to host
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+      clickhouse_db:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - forensic_network
+    restart: always
+
+  # ---------------------------------------------------------------------------
+  # 3. POSTGRESQL + POSTGIS CONTAINER
+  # ---------------------------------------------------------------------------
+  postgres_db:
+    build:
+      context: ./docker/postgres
+      dockerfile: Dockerfile
+    container_name: forensic_postgres
+    environment:
+      POSTGRES_DB: forensic_db
+      POSTGRES_USER: lea_admin
+      POSTGRES_PASSWORD: LocalSecurePassword123!
+      TZ: Asia/Kolkata
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lea_admin -d forensic_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - forensic_network
+    restart: always
+
+  # ---------------------------------------------------------------------------
+  # 4. CLICKHOUSE CONTAINER
+  # ---------------------------------------------------------------------------
+  clickhouse_db:
+    image: clickhouse/clickhouse-server:latest
+    container_name: forensic_clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: forensic_logs
+      CLICKHOUSE_USER: clickhouse_admin
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      CLICKHOUSE_PASSWORD: LocalClickhousePassword123!
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./docker/clickhouse/config.d/custom-config.xml:/etc/clickhouse-server/config.d/custom-config.xml
+      - ./scripts/clickhouse-init.sql:/docker-entrypoint-initdb.d/01-clickhouse-init.sql
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - forensic_network
+    restart: always
+
+  # # ---------------------------------------------------------------------------
+  # # 5. OLLAMA LOCAL LLM CONTAINER
+  # # ---------------------------------------------------------------------------
+  # ollama_server:
+  #   image: ollama/ollama:latest
+  #   container_name: forensic_ollama
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama_data:/root/.ollama
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "ollama list || exit 1"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   networks:
+  #     - forensic_network
+  #   restart: always
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  # ollama_data:
+
+networks:
+  forensic_network:
+    driver: bridge

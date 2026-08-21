@@ -1,0 +1,5 @@
+<clickhouse>
+    <timezone>Asia/Kolkata</timezone>
+    <!-- Increase max memory usage for huge multi-million row joins -->
+    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
+</clickhouse>
