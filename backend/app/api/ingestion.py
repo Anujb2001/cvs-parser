@@ -4,7 +4,11 @@ import os
 import tempfile
 from datetime import datetime
 
-from app.api.parse_input_file import parse_cdr_to_dataset, parse_ipdr_to_dataset
+from app.api.parse_input_file import (
+    parse_cdr_to_dataset,
+    parse_gprs_to_dataset,
+    parse_ipdr_to_dataset,
+)
 from app.core.database import get_clickhouse_client
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 import numpy as np
@@ -14,18 +18,20 @@ import polars as pl
 router = APIRouter()
 
 
-def sanitize_ipv4(ip_str: str) -> str:
-    """Ensures IP address string is a valid IPv4 address, defaulting to 0.0.0.0 otherwise."""
+def sanitize_ipv4(ip_str: str):
+    """Ensures IP address string is a valid IPv4 address, returning None if invalid or missing."""
     if not ip_str or pd.isna(ip_str):
-        return "0.0.0.0"
+        return None
     ip_clean = str(ip_str).strip()
+    if not ip_clean or ip_clean.lower() in ["none", "nan", "null", "0.0.0.0"]:
+        return None
     try:
         ip_obj = ipaddress.ip_address(ip_clean)
         if ip_obj.version == 4:
             return ip_clean
     except ValueError:
         pass
-    return "0.0.0.0"
+    return None
 
 
 def sanitize_ipv6(ip_str: str):
@@ -71,7 +77,7 @@ def map_call_type_enum(val) -> int:
 @router.post("/upload")
 async def upload_telecom_dump(
     case_id: str = Form(...),
-    file_type: str = Form(...),  # Expected: 'CDR', 'IPDR'
+    file_type: str = Form(...),  # Expected: 'CDR', 'IPDR', 'GPRS'
     operator: str = Form("UNKNOWN"),
     file: UploadFile = File(...),
 ):
@@ -82,10 +88,10 @@ async def upload_telecom_dump(
         )
 
     ft_upper = file_type.upper().strip()
-    if ft_upper not in ["CDR", "IPDR"]:
+    if ft_upper not in ["CDR", "IPDR", "GPRS"]:
         raise HTTPException(
             status_code=400,
-            detail="Invalid file_type provided. Only 'CDR' and 'IPDR' are supported.",
+            detail="Invalid file_type provided. Supported types: 'CDR', 'IPDR', 'GPRS'.",
         )
 
     # Save uploaded file temporarily so parse functions can read from path
@@ -100,6 +106,8 @@ async def upload_telecom_dump(
             df = parse_cdr_to_dataset(tmp_path)
         elif ft_upper == "IPDR":
             df = parse_ipdr_to_dataset(tmp_path)
+        elif ft_upper == "GPRS":
+            df = parse_gprs_to_dataset(tmp_path)
     except Exception as e:
         raise HTTPException(
             status_code=400, detail=f"Failed to parse file: {str(e)}"
@@ -131,9 +139,11 @@ async def upload_telecom_dump(
         [
             pl.lit(case_id).alias("case_id"),
             pl.lit(file.filename).alias("file_id"),
-            pl.lit(operator).alias("operator"),
         ]
     )
+
+    if "operator" not in pl_df.columns or pl_df["operator"].is_null().all():
+        pl_df = pl_df.with_columns(pl.lit(operator).alias("operator"))
 
     # 3. Target Table Selection and Schema Normalization
     if ft_upper == "CDR":
@@ -178,11 +188,36 @@ async def upload_telecom_dump(
             "file_id",
         ]
 
+    elif ft_upper == "GPRS":
+        target_table = "forensic_logs.gprs_records"
+        valid_columns = [
+            "case_id",
+            "msisdn",
+            "ipv4",
+            "ipv6",
+            "translated_ip",
+            "translated_port",
+            "destination_ip",
+            "destination_port",
+            "session_start",
+            "session_end",
+            "download_bytes",
+            "upload_bytes",
+            "total_bytes",
+            "imei",
+            "imsi",
+            "cgi",
+            "roaming_circle",
+            "operator",
+            "network_type",
+            "file_id",
+        ]
+
     # Populating missing fields with default fallbacks
     existing_cols = pl_df.columns
     for col in valid_columns:
         if col not in existing_cols:
-            pl_df = pl_df.with_columns(pl.lit("").alias(col))
+            pl_df = pl_df.with_columns(pl.lit(None).alias(col))
 
     # Keep target columns in exact expected order
     pl_df = pl_df.select(valid_columns)
@@ -210,14 +245,14 @@ async def upload_telecom_dump(
         )
         .fill_null(
             pl.col(dt_target_col).str.to_datetime(
-                format="%m/%d/%Y %H:%M", strict=False
+                format="%d-%m-%y %H:%M", strict=False
             )
         )
         .fill_null(datetime.now())
         .alias(dt_target_col)
     )
 
-    if ft_upper == "IPDR" and "session_end" in pl_df.columns:
+    if ft_upper in ["IPDR", "GPRS"] and "session_end" in pl_df.columns:
         pl_df = pl_df.with_columns(
             pl.col("session_end")
             .str.to_datetime(format="%d-%m-%Y %H:%M:%S", strict=False)
@@ -234,6 +269,11 @@ async def upload_telecom_dump(
             .fill_null(
                 pl.col("session_end").str.to_datetime(
                     format="%d-%b-%Y %H:%M:%S", strict=False
+                )
+            )
+            .fill_null(
+                pl.col("session_end").str.to_datetime(
+                    format="%d-%m-%y %H:%M", strict=False
                 )
             )
             .fill_null(pl.col(dt_target_col))
@@ -258,17 +298,13 @@ async def upload_telecom_dump(
         pandas_df["circle"] = pandas_df["circle"].fillna("").astype(str)
 
     elif ft_upper == "IPDR":
-        # IPv4 Conversions
         pandas_df["public_ip"] = pandas_df["public_ip"].apply(sanitize_ipv4)
         pandas_df["dest_ip"] = pandas_df["dest_ip"].apply(sanitize_ipv4)
-
-        # IPv6 Conversions (Returns Python None for Nullable(IPv6))
         pandas_df["public_ip_v6"] = pandas_df["public_ip_v6"].apply(
             sanitize_ipv6
         )
         pandas_df["dest_ip_v6"] = pandas_df["dest_ip_v6"].apply(sanitize_ipv6)
 
-        # Numeric conversions
         pandas_df["public_port"] = (
             pd.to_numeric(pandas_df["public_port"], errors="coerce")
             .fillna(0)
@@ -290,13 +326,59 @@ async def upload_telecom_dump(
             .astype("uint64")
         )
 
-    # Fill remaining string columns with empty strings (EXCLUDING IPv6 / datetime / numeric)
+    elif ft_upper == "GPRS":
+        pandas_df["ipv4"] = pandas_df["ipv4"].apply(sanitize_ipv4)
+        pandas_df["translated_ip"] = pandas_df["translated_ip"].apply(
+            sanitize_ipv4
+        )
+        pandas_df["destination_ip"] = pandas_df["destination_ip"].apply(
+            sanitize_ipv4
+        )
+        pandas_df["ipv6"] = pandas_df["ipv6"].apply(sanitize_ipv6)
+
+        pandas_df["translated_port"] = (
+            pd.to_numeric(pandas_df["translated_port"], errors="coerce")
+            .fillna(0)
+            .astype("uint16")
+        )
+        pandas_df["destination_port"] = (
+            pd.to_numeric(pandas_df["destination_port"], errors="coerce")
+            .fillna(0)
+            .astype("uint16")
+        )
+
+        pandas_df["download_bytes"] = (
+            pd.to_numeric(pandas_df["download_bytes"], errors="coerce")
+            .fillna(0)
+            .astype("uint64")
+        )
+        pandas_df["upload_bytes"] = (
+            pd.to_numeric(pandas_df["upload_bytes"], errors="coerce")
+            .fillna(0)
+            .astype("uint64")
+        )
+        pandas_df["total_bytes"] = (
+            pd.to_numeric(pandas_df["total_bytes"], errors="coerce")
+            .fillna(0)
+            .astype("uint64")
+        )
+
+    # EXCLUDE all IPv4 / IPv6 / Datetime columns from string conversion
+    # so ClickHouse driver correctly passes NULLs instead of ""
     excluded_cols = [
         dt_target_col,
         "session_end",
+        "ipv4",
+        "ipv6",
+        "translated_ip",
+        "destination_ip",
+        "public_ip",
         "public_ip_v6",
+        "dest_ip",
         "dest_ip_v6",
+        "private_ip",
     ]
+
     for col in pandas_df.columns:
         if (
             col not in excluded_cols
